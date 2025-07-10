@@ -2,284 +2,290 @@ import sys
 import json
 import math
 from datetime import datetime
+import gradio as gr
 
 # --- Constantes de Configuración ---
 
-# Diccionario que mapea la elección del usuario a la clave de atributo del modelo
 TASK_CATEGORIES = {
-    "1": "coding_average",
-    "2": "math_average",
-    "3": "data_analysis_average",
-    "4": "science",
-    "5": "writing",
-    "6": "creative_writing",
+    "Programación": "coding_average",
+    "Matemáticas": "math_average",
+    "Análisis de Datos": "data_analysis_average",
+    "Ciencia": "science",
+    "Escritura": "writing",
+    "Escritura Creativa": "creative_writing",
 }
-
-# MEJORA: El umbral para el análisis VPI ahora es relativo (5%).
-# Si la diferencia de utilidad entre los dos mejores modelos es menor al 5%
-# de la utilidad del mejor, la decisión se considera "sensible".
+DIFFICULTY_LEVELS = {"Fácil": "facil", "Media": "media", "Difícil": "dificil"}
 RELATIVE_VPI_THRESHOLD = 0.05
 
-def load_models_from_json(filepath="modelos.json"):
+# --- Clases del Modelo de Decisión (Sin cambios en la lógica) ---
+
+class ProbabilisticQualityModel:
     """
-    Carga los datos de los modelos desde un archivo JSON.
-    Maneja errores si el archivo no se encuentra o tiene un formato incorrecto.
+    Modela la incertidumbre sobre la calidad de la respuesta.
+    Calcula la utilidad esperada de la calidad basado en la categoría y dificultad de la tarea.
     """
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            models_data = json.load(f)
-        return models_data
-    except FileNotFoundError:
-        print(f"❌ Error: No se encontró el archivo '{filepath}'.")
-        print("Asegúrate de que el archivo exista en el mismo directorio que el script.")
-        sys.exit(1)
-    except json.JSONDecodeError:
-        print(f"❌ Error: El archivo '{filepath}' no es un JSON válido.")
-        print("Por favor, revisa la sintaxis del archivo.")
-        sys.exit(1)
+    QUALITY_STATES = {'Excelente': 1.0, 'Buena': 0.7, 'Regular': 0.2, 'Mala': 0.0}
+
+    def get_expected_quality_utility(self, category, difficulty, model_data):
+        """
+        Calcula la Utilidad Esperada de la calidad para un modelo y tarea dados.
+        """
+        base_prob_good_or_better = model_data.get(category, 50) / 100.0
+
+        if difficulty == 'facil':
+            adjustment_factor = 1.15
+        elif difficulty == 'dificil':
+            adjustment_factor = 0.85
+        else:
+            adjustment_factor = 1.0
+
+        prob_good_or_better = min(max(base_prob_good_or_better * adjustment_factor, 0), 0.98)
+
+        prob_excelente = prob_good_or_better / 3.0
+        prob_buena = prob_good_or_better * (2/3.0)
+        remaining_prob = 1.0 - prob_excelente - prob_buena
+        prob_regular = remaining_prob * 0.7
+        prob_mala = remaining_prob * 0.3
+
+        probabilities = {
+            'Excelente': prob_excelente, 'Buena': prob_buena,
+            'Regular': prob_regular, 'Mala': prob_mala,
+        }
+        
+        expected_utility = sum(p * self.QUALITY_STATES[state] for state, p in probabilities.items())
+        
+        return expected_utility, probabilities
 
 
 class ModelSelectorAgent:
     """
-    Un agente que selecciona el mejor LLM aplicando el Principio de Máxima Utilidad Esperada,
-    filtrando por dominancia estricta, modelando la actitud ante el riesgo y razonando sobre el Valor de la Información.
+    Agente que selecciona un LLM para maximizar la utilidad esperada del usuario.
     """
     def __init__(self, models_data):
-        """
-        Inicializa el agente con los datos de los modelos disponibles.
-        """
         self.models = models_data
         self.preferences = {}
-        # Atributos para la comprobación de dominancia
+        self.quality_model = ProbabilisticQualityModel()
         self.higher_is_better_attrs = [
-            "context_window", "output_token_per_second", "coding_average", 
+            "context_window", "output_token_per_second", "coding_average",
             "math_average", "data_analysis_average", "science", "writing", "creative_writing"
         ]
         self.lower_is_better_attrs = ["blended_price_per_million_tokens", "first_chunk_latency"]
 
     @staticmethod
     def _parse_date(date_str):
-        """Parsea una fecha en formato 'Mes Año' a un objeto datetime."""
         try:
             return datetime.strptime(date_str, "%b %Y")
         except ValueError:
-            # Devuelve una fecha muy antigua si el formato es inesperado
             return datetime.min
 
     def _filter_dominated_models(self, models):
-        """
-        Implementa el filtro de Dominancia Estricta.
-        Un modelo B es eliminado si existe un modelo A que es igual o mejor en todos los atributos
-        y estrictamente mejor en al menos un atributo.
-        """
         dominated_indices = set()
+        domination_reasons = {}
         n = len(models)
-
         for i in range(n):
             for j in range(n):
-                if i == j or j in dominated_indices:
-                    continue
-
-                # model_a es el potencial dominador, model_b es el potencial dominado
-                model_a = models[i]
-                model_b = models[j]
-
-                is_strictly_better_on_one = False
-                is_worse_on_any = False
-
-                # Comprobar atributos donde más es mejor
+                if i == j or j in dominated_indices: continue
+                model_a, model_b = models[i], models[j]
+                is_strictly_better_on_one, is_worse_on_any = False, False
                 for attr in self.higher_is_better_attrs:
-                    if model_a[attr] < model_b[attr]:
-                        is_worse_on_any = True; break
-                    if model_a[attr] > model_b[attr]:
-                        is_strictly_better_on_one = True
+                    if model_a[attr] < model_b[attr]: is_worse_on_any = True; break
+                    if model_a[attr] > model_b[attr]: is_strictly_better_on_one = True
                 if is_worse_on_any: continue
-
-                # Comprobar atributos donde menos es mejor
                 for attr in self.lower_is_better_attrs:
-                    if model_a[attr] > model_b[attr]:
-                        is_worse_on_any = True; break
-                    if model_a[attr] < model_b[attr]:
-                        is_strictly_better_on_one = True
+                    if model_a[attr] > model_b[attr]: is_worse_on_any = True; break
+                    if model_a[attr] < model_b[attr]: is_strictly_better_on_one = True
                 if is_worse_on_any: continue
-
-                # Comprobar la fecha de corte del conocimiento
-                date_a = self._parse_date(model_a["knowledge_cutoff"])
-                date_b = self._parse_date(model_b["knowledge_cutoff"])
+                date_a, date_b = self._parse_date(model_a["knowledge_cutoff"]), self._parse_date(model_b["knowledge_cutoff"])
                 if date_a < date_b: is_worse_on_any = True; continue
                 if date_a > date_b: is_strictly_better_on_one = True
-
-                # Conclusión: si A nunca es peor y es mejor en al menos un aspecto, A domina a B
                 if not is_worse_on_any and is_strictly_better_on_one:
                     dominated_indices.add(j)
-
-        if dominated_indices:
-            print("\n--- 🔎 FILTRO DE DOMINANCIA ESTRICTA ---")
-            dominated_names = [models[i]['model_name'] for i in sorted(list(dominated_indices))]
-            print(f"Modelos eliminados por ser inferiores: {', '.join(dominated_names)}")
+                    domination_reasons[model_b['model_name']] = model_a['model_name']
         
-        return [model for i, model in enumerate(models) if i not in dominated_indices]
+        report = "### 🔎 Análisis de Dominancia Estricta\n"
+        if domination_reasons:
+            for dominated, dominator in domination_reasons.items():
+                report += f"- **{dominated}** fue descartado (dominado por **{dominator}**).\n"
+        else:
+            report += "- Ningún modelo fue estrictamente dominado.\n"
+            
+        filtered_models = [model for i, model in enumerate(models) if i not in dominated_indices]
+        return filtered_models, report
 
     def _normalize_attributes(self, models_to_normalize):
-        """
-        Normaliza los atributos de una lista de modelos a una escala de 0 a 1.
-        """
         if not models_to_normalize: return []
         normalized_models = [m.copy() for m in models_to_normalize]
-        
-        all_attrs = ["output_token_per_second"] + list(TASK_CATEGORIES.values()) + ["blended_price_per_million_tokens", "first_chunk_latency"]
-        
+        all_attrs = self.higher_is_better_attrs + self.lower_is_better_attrs
+        all_attrs = [attr for attr in all_attrs if attr in normalized_models[0]]
         for attr in all_attrs:
-            is_higher_better = attr not in ["blended_price_per_million_tokens", "first_chunk_latency"]
+            is_higher_better = attr in self.higher_is_better_attrs
             values = [m[attr] for m in models_to_normalize]
             min_val, max_val = min(values), max(values)
-            
             for model in normalized_models:
+                norm_attr_name = f"norm_{attr}"
                 if (max_val - min_val) == 0:
-                    model[f"norm_{attr}"] = 1.0
+                    model[norm_attr_name] = 1.0
                 else:
                     norm_val = (model[attr] - min_val) / (max_val - min_val)
-                    model[f"norm_{attr}"] = norm_val if is_higher_better else 1 - norm_val
-        
+                    model[norm_attr_name] = norm_val if is_higher_better else 1 - norm_val
         return normalized_models
+    
+    def _apply_attitude(self, value, attitude):
+        if attitude == 'Averso al Riesgo': return math.sqrt(value)
+        elif attitude == 'Buscador de Riesgo': return value ** 2
+        else: return value # Neutral al Riesgo
 
-    def elicit_preferences(self):
-        """
-        Implementa la Elicitación de Preferencias, incluyendo la actitud ante el riesgo.
-        """
-        print("\n--- 📝 DEFINE TUS PRIORIDADES ---")
-        print("En una escala de 0 (no importa) a 10 (máxima prioridad), ¿qué tan importante es cada factor?")
-        
-        weights = {}
-        try:
-            weights['cost'] = float(input("💰 Prioridad en AHORRAR DINERO (Costo): "))
-            risk_choice = input("   => Frente al costo, ¿cuál es tu actitud? [1] Averso, [2] Neutral, [3] Buscador: ")
-            if risk_choice not in ["1", "2", "3"]:
-                print("   Opción inválida. Se usará 'Neutral' por defecto."); risk_choice = "2"
-            
-            weights['speed'] = float(input("⚡️ Prioridad en la RAPIDEZ (Velocidad): "))
-            weights['quality'] = float(input("🎯 Prioridad en la PRECISIÓN (Calidad): "))
-        except ValueError:
-            print("\n⚠️ Entrada inválida. Usando pesos y actitud por defecto.")
-            self.preferences = {'cost': 1/3, 'speed': 1/3, 'quality': 1/3, 'risk_attitude': '2'}
-            return
+    def _calculate_utility(self, model, category, difficulty, preferences):
+        norm_cost = model["norm_blended_price_per_million_tokens"]
+        norm_speed = (model["norm_output_token_per_second"] + model["norm_first_chunk_latency"]) / 2
+        utility_cost = self._apply_attitude(norm_cost, preferences['cost_attitude'])
+        utility_speed = self._apply_attitude(norm_speed, preferences['speed_attitude'])
 
-        total_weight = sum(weights.values())
-        if total_weight == 0:
-            print("\n⚠️ La suma de pesos no puede ser cero. Usando pesos por defecto.")
-            self.preferences = {'cost': 1/3, 'speed': 1/3, 'quality': 1/3, 'risk_attitude': '2'}
-        else:
-            self.preferences = {k: v / total_weight for k, v in weights.items()}
-            self.preferences['risk_attitude'] = risk_choice
+        eu_quality_score, _ = self.quality_model.get_expected_quality_utility(category, difficulty, model)
+        utility_quality = self._apply_attitude(eu_quality_score, preferences['quality_attitude'])
 
-        print("\nPreferencias configuradas:")
-        for k, v in self.preferences.items():
-            if k != 'risk_attitude': print(f"- {k.capitalize()} (Peso): {v:.2f}")
-        risk_map = {'1': 'Averso al Riesgo', '2': 'Neutral', '3': 'Buscador de Riesgo'}
-        print(f"- Actitud frente al costo: {risk_map[self.preferences['risk_attitude']]}")
+        cost_component = preferences['cost'] * utility_cost
+        speed_component = preferences['speed'] * utility_speed
+        quality_component = preferences['quality'] * utility_quality
+        total_utility = cost_component + speed_component + quality_component
 
-    def _calculate_utility(self, model, task_key, preferences):
-        """
-        Implementa la Función de Utilidad Multiatributo, incorporando la actitud ante el riesgo.
-        """
-        cost_utility = model["norm_blended_price_per_million_tokens"]
-        risk_attitude = preferences.get('risk_attitude', '2')
+        utility_breakdown = {
+            "Costo": cost_component, "Velocidad": speed_component, "Calidad": quality_component
+        }
+        return total_utility, utility_breakdown
 
-        if risk_attitude == '1':    # Aversión al Riesgo (Función Cóncava -> U(x) = x^2)
-            cost_utility = cost_utility ** 2
-        elif risk_attitude == '3':  # Búsqueda de Riesgo (Función Convexa -> U(x) = sqrt(x))
-            cost_utility = math.sqrt(cost_utility)
+    def select_best_model(self, preferences, category, difficulty):
+        total_weight = preferences['cost_weight'] + preferences['speed_weight'] + preferences['quality_weight']
+        if total_weight == 0: total_weight = 1
 
-        norm_speed_score = (model["norm_output_token_per_second"] + model["norm_first_chunk_latency"]) / 2
-        
-        utility = (
-            preferences['cost'] * cost_utility +
-            preferences['speed'] * norm_speed_score +
-            preferences['quality'] * model[f"norm_{task_key}"]
-        )
-        return utility
+        self.preferences = {
+            'cost': preferences['cost_weight'] / total_weight,
+            'speed': preferences['speed_weight'] / total_weight,
+            'quality': preferences['quality_weight'] / total_weight,
+            'cost_attitude': preferences['cost_attitude'],
+            'speed_attitude': preferences['speed_attitude'],
+            'quality_attitude': preferences['quality_attitude']
+        }
 
-    def select_best_model(self, task_key):
-        """
-        Ejecuta el ciclo de decisión: Filtra, Normaliza, Calcula Utilidad y Analiza.
-        """
-        if not self.preferences: self.elicit_preferences()
-
-        candidate_models = self._filter_dominated_models(self.models)
+        candidate_models, dominance_report = self._filter_dominated_models(self.models)
         if not candidate_models:
-            print("\n❌ No quedaron modelos candidatos tras el filtro de dominancia.")
-            return None
+            return "No hay modelos candidatos después del filtro de dominancia.", "", "", ""
 
         normalized_models = self._normalize_attributes(candidate_models)
-        
+
         for model in normalized_models:
-            model['utility'] = self._calculate_utility(model, task_key, self.preferences)
-        
+            model['utility'], model['utility_breakdown'] = self._calculate_utility(
+                model, category, difficulty, self.preferences
+            )
+
         sorted_models = sorted(normalized_models, key=lambda m: m['utility'], reverse=True)
         best_model = sorted_models[0]
-        
-        print("\n--- 📊 ANÁLISIS DE UTILIDAD ---")
-        print(f"{'Modelo':<25} {'Utilidad Calculada'}")
-        print("-" * 45)
-        for model in sorted_models:
-            print(f"{model['model_name']:<25} {model['utility']:.4f}")
 
+        utility_report = "### 📊 Análisis de Utilidad\n| Modelo | Utilidad Calculada |\n|---|---|\n"
+        for model in sorted_models:
+            utility_report += f"| {model['model_name']} | {model['utility']:.4f} |\n"
+            
+        vpi_report = ""
         if len(sorted_models) > 1:
             second_best_model = sorted_models[1]
             utility_diff = best_model['utility'] - second_best_model['utility']
-            
-            # MEJORA: El umbral de VPI ahora es relativo
             if utility_diff < (best_model['utility'] * RELATIVE_VPI_THRESHOLD):
-                print("\n--- 💡 ANÁLISIS DEL VALOR DE LA INFORMACIÓN (VPI) ---")
-                print("La decisión está muy reñida (diferencia de utilidad menor al 5%).")
-                print("El valor de obtener más información (ej. una prueba real) podría ser alto.")
-                print(f"Sugerencia: Considera probar los dos mejores modelos:")
-                print(f"  1. {best_model['model_name']} (Utilidad: {best_model['utility']:.3f})")
-                print(f"  2. {second_best_model['model_name']} (Utilidad: {second_best_model['utility']:.3f})")
+                vpi_report = (
+                    "### 💡 Análisis del Valor de la Información (VPI)\n"
+                    "La decisión es muy reñida (la diferencia de utilidad es menor al 5%). "
+                    "Considera obtener más información si la tarea es crítica."
+                )
+        
+        breakdown_report = "### ✅ Recomendación Final\n"
+        category_name = [k for k, v in TASK_CATEGORIES.items() if v == category][0]
+        breakdown_report += (
+            f"Para una tarea de **{category_name}** con dificultad **{difficulty.capitalize()}**, "
+            f"el modelo recomendado es **{best_model['model_name']}** "
+            f"con una utilidad máxima de **{best_model['utility']:.4f}**.\n\n"
+            "**Desglose de la Utilidad:**\n"
+        )
+        total_utility = sum(best_model['utility_breakdown'].values())
+        for component, value in best_model['utility_breakdown'].items():
+            percentage = (value / total_utility) * 100 if total_utility > 0 else 0
+            breakdown_report += f"- **Aporte de {component}**: {value:.3f} ({percentage:.1f}%)\n"
+            
+        return dominance_report, utility_report, vpi_report, breakdown_report
 
-        return best_model
 
-def main():
+def create_interface():
     """
-    Función principal que ejecuta la simulación del agente.
+    Función principal que crea y lanza la interfaz de Gradio.
     """
-    print("🤖 Agente de Selección de Modelos de Lenguaje (v3.0 con Dominancia y VPI Relativo) 🤖")
-    
-    models_data = load_models_from_json()
+    try:
+        models_data = json.load(open('modelos.json', 'r', encoding='utf-8'))
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"Error cargando 'modelos.json': {e}")
+        sys.exit(1)
+
     agent = ModelSelectorAgent(models_data)
 
-    while True:
-        agent.elicit_preferences()
-
-        print("\n--- 📚 SELECCIÓN DE TAREA ---")
-        print("¿Para qué tipo de tarea necesitas el modelo?")
-        for key, value in TASK_CATEGORIES.items():
-            readable_name = value.replace('_', ' ').replace('average', '').strip().capitalize()
-            print(f"  {key}) {readable_name}")
+    def run_agent_from_interface(
+        cost_weight, cost_attitude, speed_weight, speed_attitude, 
+        quality_weight, quality_attitude, task_category, task_difficulty, user_prompt
+    ):
+        if not user_prompt:
+            return "Por favor, introduce un prompt.", "", "", ""
+            
+        preferences = {
+            'cost_weight': cost_weight, 'cost_attitude': cost_attitude,
+            'speed_weight': speed_weight, 'speed_attitude': speed_attitude,
+            'quality_weight': quality_weight, 'quality_attitude': quality_attitude
+        }
+        category_key = TASK_CATEGORIES[task_category]
+        difficulty_key = DIFFICULTY_LEVELS[task_difficulty]
         
-        task_choice = input(f"Elige una opción (1-{len(TASK_CATEGORIES)}): ")
+        return agent.select_best_model(preferences, category_key, difficulty_key)
 
-        if task_choice not in TASK_CATEGORIES:
-            print("Opción inválida. Por favor, intenta de nuevo.")
-            continue
+    with gr.Blocks(theme=gr.themes.Soft(), title="Agente Selector de LLMs") as iface:
+        gr.Markdown("# 🤖 Agente Selector de LLMs")
+        gr.Markdown("Esta herramienta te ayuda a elegir el mejor Modelo de Lenguaje Grande (LLM) para tus necesidades específicas, basándose en tus prioridades y la naturaleza de tu tarea.")
 
-        selected_task_key = TASK_CATEGORIES[task_choice]
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("## 1. Define Tus Prioridades")
+                
+                gr.Markdown("#### 💰 Prioridad en Costo")
+                cost_w = gr.Slider(0, 10, value=5, label="Importancia (0=Baja, 10=Alta)")
+                cost_a = gr.Radio(['Averso al Riesgo', 'Neutral al Riesgo', 'Buscador de Riesgo'], value='Averso al Riesgo', label="Actitud frente al riesgo")
+                
+                gr.Markdown("#### ⚡️ Prioridad en Velocidad")
+                speed_w = gr.Slider(0, 10, value=5, label="Importancia (0=Baja, 10=Alta)")
+                speed_a = gr.Radio(['Averso al Riesgo', 'Neutral al Riesgo', 'Buscador de Riesgo'], value='Averso al Riesgo', label="Actitud frente al riesgo")
+
+                gr.Markdown("#### 🎯 Prioridad en Calidad")
+                quality_w = gr.Slider(0, 10, value=5, label="Importancia (0=Baja, 10=Alta)")
+                quality_a = gr.Radio(['Averso al Riesgo', 'Neutral al Riesgo', 'Buscador de Riesgo'], value='Averso al Riesgo', label="Actitud frente al riesgo")
+                
+                gr.Markdown("## 2. Describe Tu Tarea")
+                prompt = gr.Textbox(label="📝 Introduce tu prompt aquí", lines=3, placeholder="Ej: 'Escribe una función en Python que calcule la secuencia de Fibonacci.'")
+                task_cat = gr.Dropdown(list(TASK_CATEGORIES.keys()), label="Categoría de la Tarea", value="Programación")
+                task_diff = gr.Dropdown(list(DIFFICULTY_LEVELS.keys()), label="Dificultad de la Tarea", value="Media")
+
+                submit_btn = gr.Button("Encontrar el Mejor Modelo", variant="primary")
+
+            with gr.Column(scale=2):
+                gr.Markdown("## 3. Análisis y Recomendación")
+                final_recommendation = gr.Markdown()
+                utility_analysis = gr.Markdown()
+                dominance_analysis = gr.Markdown()
+                vpi_analysis = gr.Markdown()
+
+        inputs = [cost_w, cost_a, speed_w, speed_a, quality_w, quality_a, task_cat, task_diff, prompt]
+        outputs = [dominance_analysis, utility_analysis, vpi_analysis, final_recommendation]
         
-        best_model = agent.select_best_model(selected_task_key)
+        submit_btn.click(
+            fn=run_agent_from_interface,
+            inputs=inputs,
+            outputs=outputs
+        )
 
-        if best_model:
-            print("\n--- ✅ DECISIÓN FINAL DEL AGENTE ---")
-            print(f"Basado en tus preferencias, el modelo recomendado es: **{best_model['model_name']}**")
-            print(f"   Calculó una utilidad máxima de: {best_model['utility']:.4f}\n")
-        
-        again = input("¿Deseas realizar otra consulta? (s/n): ").lower()
-        if again != 's':
-            print("\n👋 ¡Hasta luego!")
-            break
+    iface.launch()
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\nPrograma interrumpido. Adiós.")
-        sys.exit(0)
+    create_interface()

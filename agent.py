@@ -17,7 +17,7 @@ TASK_CATEGORIES = {
 DIFFICULTY_LEVELS = {"Fácil": "facil", "Media": "media", "Difícil": "dificil"}
 RELATIVE_VPI_THRESHOLD = 0.05
 
-# --- Clases del Modelo de Decisión (Sin cambios en la lógica) ---
+# --- Clases del Modelo de Decisión ---
 
 class ProbabilisticQualityModel:
     """
